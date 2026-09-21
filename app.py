@@ -22,7 +22,7 @@ CORS(app) # Activer CORS pour toutes les routes
 # CONFIGURATION
 # ========================================================================
 
-DATASET_PATH = 'C:/Users/morel/Desktop/Resume1.csv' # Chemin vers le dataset CSV 
+DATASET_PATH = 'archive_cv1/Resume/Resume1.csv'# Chemin vers le dataset CSV 
 MODELS_DIR = 'models' # Dossier pour sauvegarder les modèles entraînés 
 UPLOAD_FOLDER = 'uploads' # Dossier pour les CVs uploadés 
 
