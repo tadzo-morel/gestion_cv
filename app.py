@@ -3,38 +3,53 @@
 # Système d'analyse de CV avec Dataset intégré
 # ========================================================================
 
-from flask import Flask, request, jsonify, render_template_string # Framework web Flask pour Python et gestion des requêtes 
-from flask_cors import CORS # Pour gérer les CORS 
+from flask import Flask, request, jsonify, render_template_string # Framework web Flask pour Python et gestion des requêtes
+from flask_cors import CORS # Pour gérer les CORS
 import pandas as pd # Pour la manipulation des données
 import numpy as np # Pour les opérations numériques
 import pickle # Pour sauvegarder et charger les modèles
 import os # Pour la gestion des fichiers
-from sklearn.feature_extraction.text import TfidfVectorizer # Pour la vectorisation TF-IDF 
-from sklearn.preprocessing import LabelEncoder # Pour l'encodage des labels 
-from sklearn.ensemble import RandomForestClassifier # Modèle Random Forest 
+from sklearn.feature_extraction.text import TfidfVectorizer # Pour la vectorisation TF-IDF
+from sklearn.preprocessing import LabelEncoder # Pour l'encodage des labels
+from sklearn.ensemble import RandomForestClassifier # Modèle Random Forest
 from sklearn.model_selection import train_test_split # Pour diviser les données en ensembles d'entraînement et de test
-import re # Pour le nettoyage du texte 
+import re # Pour le nettoyage du texte
 
-app = Flask(__name__) # Initialisation de l'application Flask 
+from pypdf import PdfReader # Pour extraire le texte des CV au format PDF
+import docx as python_docx # Pour extraire le texte des CV au format DOCX (le module s'appelle "docx")
+
+app = Flask(__name__) # Initialisation de l'application Flask
 CORS(app) # Activer CORS pour toutes les routes
 
 # ========================================================================
 # CONFIGURATION
 # ========================================================================
 
-DATASET_PATH = 'archive_cv1/Resume/Resume1.csv'# Chemin vers le dataset CSV 
-MODELS_DIR = 'models' # Dossier pour sauvegarder les modèles entraînés 
-UPLOAD_FOLDER = 'uploads' # Dossier pour les CVs uploadés 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) # Dossier du projet, quel que soit l'endroit d'où l'on lance le script
 
-os.makedirs(MODELS_DIR, exist_ok=True) # Crée le dossier des modèles s'il n'existe pas 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)# Crée le dossier des uploads s'il n'existe pas 
+# Chemin vers le dataset CSV. Peut être surchargé par la variable d'environnement
+# CV_DATASET_PATH si le fichier se trouve ailleurs sur ta machine.
+DATASET_PATH = os.environ.get(
+    'CV_DATASET_PATH',
+    os.path.join(BASE_DIR, 'archive_cv1', 'Resume', 'Resume1.csv')
+)
+MODELS_DIR = os.path.join(BASE_DIR, 'models') # Dossier pour sauvegarder les modèles entraînés
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads') # Dossier pour les CVs uploadés
+
+ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt'} # Formats de CV acceptés à l'upload
+MAX_CONTENT_LENGTH = 10 * 1024 * 1024 # Taille max d'un upload (10 Mo), toutes pièces confondues
+
+os.makedirs(MODELS_DIR, exist_ok=True) # Crée le dossier des modèles s'il n'existe pas
+os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Crée le dossier des uploads s'il n'existe pas
+
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # Variables globales
 df = None # DataFrame du dataset
-vectorizer = None # TF-IDF Vectorizer 
-label_encoder = None # Encodeur de labels initialisé au démarrage  avec aucun modèle chargé
+vectorizer = None # TF-IDF Vectorizer
+label_encoder = None # Encodeur de labels initialisé au démarrage avec aucun modèle chargé
 best_model = None # Meilleur modèle ML
-dataset_stats = None # Statistiques du dataset 
+dataset_stats = None # Statistiques du dataset
 
 
 # ========================================================================
@@ -43,62 +58,33 @@ dataset_stats = None # Statistiques du dataset
 
 def clean_text(text):
     """Nettoie le texte des CV"""
-    text = str(text).lower() # Convertir en minuscules 
-    text = re.sub(r'[^a-zA-Z0-9\s]', '', text) # Supprimer la ponctuation 
-    text = re.sub(r'\s+', ' ', text) # Supprimer les espaces multiples 
-    return text.strip() # Supprimer les espaces en début/fin 
+    text = str(text).lower() # Convertir en minuscules
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text) # Supprimer la ponctuation
+    text = re.sub(r'\s+', ' ', text) # Supprimer les espaces multiples
+    return text.strip() # Supprimer les espaces en début/fin
 
 
-def load_and_prepare_dataset(): 
-    """Charge et prépare le dataset"""
-    global df, vectorizer, label_encoder, best_model, dataset_stats # Variables globales
-    
-    print("Chargement du dataset...") 
-    df = pd.read_csv(DATASET_PATH) # Charger le dataset CSV
-    
-    # Nettoyage
-    df['cleaned_text'] = df['Resume_str'].apply(clean_text) # Nettoyer les CVs
-    df_clean = df[df['cleaned_text'] != ''].copy() # Supprimer les CVs vides 
-    
-    # Encodage
-    label_encoder = LabelEncoder() # Initialiser l'encodeur de labels
-    y = label_encoder.fit_transform(df_clean['Category']) # Encoder les catégories et obtenir y
-    
-    # Vectorisation
-    vectorizer = TfidfVectorizer(max_features=1000, stop_words='english') # Initialiser le vectorizer TF-IDF 
-    X = vectorizer.fit_transform(df_clean['cleaned_text']) # Vectoriser les CVs et obtenir X entrainement des données
-    
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    
-    # Entraîner le meilleur modèle (Random Forest)
-    best_model = RandomForestClassifier(n_estimators=100 , random_state=42) # Initialiser le modèle Random Forest
-    best_model.fit(X_train, y_train)
-    
-    accuracy = best_model.score(X_test, y_test) # Évaluer la précision sur l'ensemble de test
-    
-    # Statistiques du dataset
+def _compute_dataset_stats(df_clean, accuracy):
+    """Construit le dictionnaire de statistiques à partir du dataset nettoyé"""
     category_counts = df_clean['Category'].value_counts()
-    
+
     # Extraction des compétences
     skills_keywords = [
         'ai', 'management', 'excel', 'communication', 'leadership',
         'python', 'java', 'javascript', 'sql', 'machine learning'
     ]
-    
+
     skill_counts = {}
     for skill in skills_keywords:
         count = df_clean['cleaned_text'].str.contains(skill, na=False).sum() # Compter les CVs contenant la compétence recherchée
         if count > 0:
             skill_counts[skill] = int(count)
-    
-    dataset_stats = {
+
+    return {
         'total_cvs': len(df_clean),
-        'categories': len(label_encoder.classes_),
+        'categories': int(df_clean['Category'].nunique()),
         'top_categories': [
-            {'name': cat, 'count': int(count), 'percentage': round(count/len(df_clean)*100, 2)}
+            {'name': cat, 'count': int(count), 'percentage': round(count / len(df_clean) * 100, 2)}
             for cat, count in category_counts.head(10).items()
         ],
         'top_skills': [
@@ -108,34 +94,126 @@ def load_and_prepare_dataset():
         'model_accuracy': round(accuracy * 100, 2),
         'model_name': 'Random Forest'
     }
-    
-    # Sauvegarder les modèles
-    with open(os.path.join(MODELS_DIR, 'vectorizer.pkl'), 'wb') as f:
-        pickle.dump(vectorizer, f) # Sauvegarder le vectorizer
-    with open(os.path.join(MODELS_DIR, 'label_encoder.pkl'), 'wb') as f:
-        pickle.dump(label_encoder, f) # Sauvegarder l'encodeur de labels
-    with open(os.path.join(MODELS_DIR, 'best_model.pkl'), 'wb') as f:
-        pickle.dump(best_model, f) # Sauvegarder le meilleur modèle
-    
-    print(f"✓ Dataset chargé: {len(df_clean)} CV") 
-    print(f"✓ Modèle entraîné: Accuracy {accuracy*100:.2f}%") # Afficher la précision du modèle 02 décimales
-    
+
+
+def _load_clean_dataset():
+    """Charge le CSV et renvoie le dataset nettoyé (sans les CV vides)"""
+    raw = pd.read_csv(DATASET_PATH) # Charger le dataset CSV
+    raw['cleaned_text'] = raw['Resume_str'].apply(clean_text) # Nettoyer les CVs
+    return raw[raw['cleaned_text'] != ''].copy() # Supprimer les CVs vides
+
+
+def load_and_prepare_dataset(force_retrain=False):
+    """Charge le dataset et le modèle.
+
+    Par défaut, réutilise un modèle déjà entraîné et sauvegardé dans
+    models/ (démarrage quasi instantané). Passe force_retrain=True, ou
+    supprime le contenu de models/, pour ré-entraîner depuis zéro.
+    """
+    global df, vectorizer, label_encoder, best_model, dataset_stats # Variables globales
+
+    print("Chargement du dataset...")
+    df = _load_clean_dataset()
+
+    vectorizer_path = os.path.join(MODELS_DIR, 'vectorizer.pkl')
+    encoder_path = os.path.join(MODELS_DIR, 'label_encoder.pkl')
+    model_path = os.path.join(MODELS_DIR, 'best_model.pkl')
+    saved_models_exist = all(os.path.exists(p) for p in (vectorizer_path, encoder_path, model_path))
+
+    if saved_models_exist and not force_retrain:
+        print("Modèles déjà entraînés trouvés dans models/, chargement direct...")
+        with open(vectorizer_path, 'rb') as f:
+            vectorizer = pickle.load(f)
+        with open(encoder_path, 'rb') as f:
+            label_encoder = pickle.load(f)
+        with open(model_path, 'rb') as f:
+            best_model = pickle.load(f)
+
+        # On réévalue rapidement la précision sur un échantillon de test pour l'affichage
+        X = vectorizer.transform(df['cleaned_text'])
+        y = label_encoder.transform(df['Category'])
+        _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        accuracy = best_model.score(X_test, y_test)
+    else:
+        print("Aucun modèle sauvegardé (ou ré-entraînement forcé) — entraînement en cours...")
+        # Encodage
+        label_encoder = LabelEncoder() # Initialiser l'encodeur de labels
+        y = label_encoder.fit_transform(df['Category']) # Encoder les catégories et obtenir y
+
+        # Vectorisation
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words='english') # Initialiser le vectorizer TF-IDF
+        X = vectorizer.fit_transform(df['cleaned_text']) # Vectoriser les CVs et obtenir X d'entraînement
+
+        # Split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        # Entraîner le meilleur modèle (Random Forest)
+        best_model = RandomForestClassifier(n_estimators=100, random_state=42) # Initialiser le modèle Random Forest
+        best_model.fit(X_train, y_train)
+
+        accuracy = best_model.score(X_test, y_test) # Évaluer la précision sur l'ensemble de test
+
+        # Sauvegarder les modèles pour accélérer les prochains démarrages
+        with open(vectorizer_path, 'wb') as f:
+            pickle.dump(vectorizer, f) # Sauvegarder le vectorizer
+        with open(encoder_path, 'wb') as f:
+            pickle.dump(label_encoder, f) # Sauvegarder l'encodeur de labels
+        with open(model_path, 'wb') as f:
+            pickle.dump(best_model, f) # Sauvegarder le meilleur modèle
+
+    dataset_stats = _compute_dataset_stats(df, accuracy)
+
+    print(f"✅ Dataset chargé: {len(df)} CV")
+    print(f"✅ Modèle prêt: Accuracy {accuracy * 100:.2f}%") # Afficher la précision du modèle à 2 décimales
+
     return dataset_stats
+
+
+def extract_text_from_upload(file_storage):
+    """Extrait le texte brut d'un CV uploadé (PDF, DOCX ou TXT)
+
+    Lève une ValueError avec un message utilisateur si le format n'est
+    pas supporté, ou si le fichier ne contient aucun texte exploitable
+    (cas fréquent d'un PDF scanné sans couche de texte).
+    """
+    filename = file_storage.filename or ''
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"Format .{ext or '?'} non supporté (formats acceptés : PDF, DOCX, TXT)")
+
+    if ext == 'pdf':
+        reader = PdfReader(file_storage)
+        text = '\n'.join((page.extract_text() or '') for page in reader.pages)
+    elif ext == 'docx':
+        document = python_docx.Document(file_storage)
+        text = '\n'.join(p.text for p in document.paragraphs)
+    else:  # txt
+        text = file_storage.read().decode('utf-8', errors='ignore')
+
+    text = text.strip()
+    if not text:
+        raise ValueError(
+            "Aucun texte trouvé dans ce fichier (probablement un PDF scanné/image sans couche de texte)"
+        )
+    return text
 
 
 def predict_cv(cv_text):
     """Prédit la catégorie d'un CV"""
     if not best_model or not vectorizer or not label_encoder:
         return None
-    
+
     # Nettoyer et vectoriser
     cleaned = clean_text(cv_text)
     vectorized = vectorizer.transform([cleaned])
-    
+
     # Prédire
     prediction = best_model.predict(vectorized)[0] # Obtenir la prédiction
     category = label_encoder.inverse_transform([prediction])[0] # Décoder la catégorie prédite
-    
+
     # Probabilités
     try:
         probas = best_model.predict_proba(vectorized)[0] # Obtenir les probabilités pour chaque catégorie
@@ -147,9 +225,9 @@ def predict_cv(cv_text):
             }
             for i in top_indices
         ]
-    except:
+    except Exception:
         top_categories = [{'category': category, 'probability': 100.0}]
-    
+
     return {
         'predicted_category': category,
         'top_predictions': top_categories
@@ -160,36 +238,36 @@ def analyze_cv_detailed(cv_text):
     """Analyse détaillée d'un CV"""
     # Prédiction
     prediction = predict_cv(cv_text)
-    
+
     if not prediction:
         return None
-    
+
     # Extraction de compétences
     skills_keywords = [
         'ai', 'management', 'excel', 'communication', 'leadership',
         'python', 'java', 'javascript', 'sql', 'machine learning',
         'teamwork', 'problem solving', 'marketing', 'sales'
     ]
-    
-    cv_lower = cv_text.lower() # Convertir en minuscules pour la recherche de compétences 
-    found_skills = [skill for skill in skills_keywords if skill in cv_lower] # Trouver les compétences présentes dans le CV    
+
+    cv_lower = cv_text.lower() # Convertir en minuscules pour la recherche de compétences
+    found_skills = [skill for skill in skills_keywords if skill in cv_lower] # Trouver les compétences présentes dans le CV
     # Estimation de l'expérience
     experience_patterns = [
         r'(\d+)\s*(?:ans?|years?)\s*(?:d\')?(?:expérience|experience)',
         r'(\d+)\+?\s*years?'
     ]
-    
+
     years = []
     for pattern in experience_patterns: # Chercher les années d'expérience
         matches = re.findall(pattern, cv_lower) # Trouver toutes les correspondances
         years.extend([int(m) for m in matches]) # Ajouter les années trouvées
-    
+
     experience = max(years) if years else 0
-    
+
     # Analyse du texte
     word_count = len(cv_text.split())
     char_count = len(cv_text)
-    
+
     return {
         'prediction': prediction,
         'skills': found_skills,
@@ -204,7 +282,7 @@ def analyze_cv_detailed(cv_text):
 def calculate_quality_score(word_count, skills_count, experience):
     """Calcule un score de qualité du CV"""
     score = 0
-    
+
     # Longueur du CV (max 30 points)
     if 300 <= word_count <= 800:
         score += 30
@@ -212,13 +290,13 @@ def calculate_quality_score(word_count, skills_count, experience):
         score += 20
     else:
         score += 10
-    
+
     # Compétences (max 40 points)
     score += min(skills_count * 5, 40)
-    
+
     # Expérience (max 30 points)
     score += min(experience * 6, 30)
-    
+
     return min(score, 100)
 
 
@@ -226,8 +304,8 @@ def calculate_quality_score(word_count, skills_count, experience):
 # ROUTES API
 # ========================================================================
 
-@app.route('/') # Page d'accueil chemein racine
-def home():  
+@app.route('/') # Page d'accueil chemin racine
+def home():
     """Page d'accueil"""
     html = """
     <!DOCTYPE html>
@@ -245,8 +323,8 @@ def home():
             .container {
                 background: white;
                 padding: 30px;
-                border-radius: 10px; 
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+                border-radius: 10px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
             }
             h1 {
                 color: #667eea;
@@ -306,14 +384,14 @@ def home():
     </head>
     <body>
         <div class="container">
-            <h1>🎓 Système d'Analyse de CV par IA</h1>
+            <h1>Système d'Analyse de CV par IA</h1>
             <p style="text-align: center; color: #718096;">
                 TPE - Morel Tadzo | Niveau 3 Informatique
             </p>
-            
+
             <div class="stats">
                 <div class="stat-card">
-                    <div class="stat-value">""" + str(dataset_stats['total_cvs'] if dataset_stats else 0) + """</div> # Nombre total de CVs
+                    <div class="stat-value">""" + str(dataset_stats['total_cvs'] if dataset_stats else 0) + """</div>
                     <div class="stat-label">CV Analysés</div>
                 </div>
                 <div class="stat-card">
@@ -329,47 +407,61 @@ def home():
                     <div class="stat-label">Meilleur Algorithme</div>
                 </div>
             </div>
-            
+
             <div class="api-docs">
-                <h2>📡 API Endpoints</h2>
-                
+                <h2>API Endpoints</h2>
+
                 <div class="endpoint">
                     <span class="method get">GET</span>
                     <code>/api/stats</code>
                     <p>Récupère les statistiques du dataset</p>
                 </div>
-                
+
                 <div class="endpoint">
                     <span class="method post">POST</span>
                     <code>/api/predict</code>
-                    <p>Prédit la catégorie d'un CV</p>
+                    <p>Prédit la catégorie d'un CV (texte brut)</p>
                     <pre>Body: { "cv_text": "votre CV ici..." }</pre>
                 </div>
-                
+
                 <div class="endpoint">
                     <span class="method post">POST</span>
                     <code>/api/analyze</code>
-                    <p>Analyse détaillée d'un CV (catégorie + compétences + score)</p>
+                    <p>Analyse détaillée d'un CV (catégorie + compétences + score), à partir de texte brut</p>
                     <pre>Body: { "cv_text": "votre CV ici..." }</pre>
                 </div>
-                
+
+                <div class="endpoint">
+                    <span class="method post">POST</span>
+                    <code>/api/analyze-file</code>
+                    <p>Analyse détaillée d'un CV uploadé au format PDF, DOCX ou TXT</p>
+                    <pre>Form-data: file=&lt;fichier&gt;</pre>
+                </div>
+
                 <div class="endpoint">
                     <span class="method post">POST</span>
                     <code>/api/compare</code>
-                    <p>Compare plusieurs CV et les classe</p>
+                    <p>Compare plusieurs CV (texte brut) et les classe</p>
                     <pre>Body: { "cvs": ["cv1", "cv2", "cv3"] }</pre>
                 </div>
+
+                <div class="endpoint">
+                    <span class="method post">POST</span>
+                    <code>/api/compare-files</code>
+                    <p>Compare plusieurs CV uploadés (PDF, DOCX ou TXT) et les classe</p>
+                    <pre>Form-data: files=&lt;fichier1&gt;, files=&lt;fichier2&gt;, ...</pre>
+                </div>
             </div>
-            
+
             <div style="text-align: center; margin-top: 30px; color: #718096;">
-                <p>✨ Application développée avec Flask + Machine Learning</p>
-                <p>Algorithmes: Random Forest, SVM, Logistic Regression, Naive Bayes</p>
+                <p>Application développée avec Flask + Machine Learning</p>
+                <p>Algorithme: Random Forest (TF-IDF)</p>
             </div>
         </div>
     </body>
     </html>
     """
-    return render_template_string(html) # Rendre le HTML 
+    return render_template_string(html) # Rendre le HTML
 
 
 @app.route('/api/stats', methods=['GET'])
@@ -377,55 +469,80 @@ def get_stats():
     """Retourne les statistiques du dataset"""
     if not dataset_stats:
         return jsonify({'error': 'Dataset non chargé'}), 500
-    
+
     return jsonify(dataset_stats)
 
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    """Prédit la catégorie d'un CV"""
+    """Prédit la catégorie d'un CV (texte brut)"""
     data = request.json
-    cv_text = data.get('cv_text')
-    
+    cv_text = data.get('cv_text') if data else None
+
     if not cv_text:
         return jsonify({'error': 'cv_text manquant'}), 400
-    
+
     result = predict_cv(cv_text)
-    
+
     if not result:
         return jsonify({'error': 'Modèle non disponible'}), 500
-    
+
     return jsonify(result)
 
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    """Analyse détaillée d'un CV"""
+    """Analyse détaillée d'un CV (texte brut)"""
     data = request.json
-    cv_text = data.get('cv_text')
-    
+    cv_text = data.get('cv_text') if data else None
+
     if not cv_text:
         return jsonify({'error': 'cv_text manquant'}), 400
-    
+
     result = analyze_cv_detailed(cv_text)
-    
+
     if not result:
-        return jsonify({'error': 'Erreur d\'analyse'}), 500
-    
+        return jsonify({'error': "Erreur d'analyse"}), 500
+
+    return jsonify(result)
+
+
+@app.route('/api/analyze-file', methods=['POST'])
+def analyze_file():
+    """Analyse détaillée d'un CV uploadé (PDF, DOCX ou TXT)"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'Aucun fichier reçu (champ "file" attendu)'}), 400
+
+    file = request.files['file']
+    if not file or file.filename == '':
+        return jsonify({'error': 'Aucun fichier sélectionné'}), 400
+
+    try:
+        cv_text = extract_text_from_upload(file)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Impossible de lire ce fichier ({e})'}), 400
+
+    result = analyze_cv_detailed(cv_text)
+    if not result:
+        return jsonify({'error': "Erreur d'analyse"}), 500
+
+    result['filename'] = file.filename
     return jsonify(result)
 
 
 @app.route('/api/compare', methods=['POST'])
 def compare():
-    """Compare plusieurs CV"""
+    """Compare plusieurs CV (texte brut)"""
     data = request.json
-    cvs = data.get('cvs', [])
-    
+    cvs = data.get('cvs', []) if data else []
+
     if not cvs or len(cvs) == 0:
         return jsonify({'error': 'Liste de CV vide'}), 400
-    
+
     results = []
-    
+
     for idx, cv_text in enumerate(cvs):
         analysis = analyze_cv_detailed(cv_text)
         if analysis:
@@ -437,17 +554,63 @@ def compare():
                 'skills_count': analysis['skills_count'],
                 'experience_years': analysis['experience_years']
             })
-    
+
     # Trier par score de qualité
     results.sort(key=lambda x: x['quality_score'], reverse=True)
-    
+
     # Ajouter le rang
     for idx, result in enumerate(results, 1):
         result['rank'] = idx
-    
+
     return jsonify({
         'total_cvs': len(results),
         'results': results
+    })
+
+
+@app.route('/api/compare-files', methods=['POST'])
+def compare_files():
+    """Compare plusieurs CV uploadés (PDF, DOCX ou TXT) et les classe"""
+    files = request.files.getlist('files')
+
+    if not files:
+        return jsonify({'error': 'Aucun fichier reçu (champ "files" attendu)'}), 400
+
+    results = []
+    errors = []
+
+    for idx, file in enumerate(files):
+        if not file or file.filename == '':
+            continue
+        try:
+            cv_text = extract_text_from_upload(file)
+        except Exception as e:
+            errors.append({'filename': file.filename, 'error': str(e)})
+            continue
+
+        analysis = analyze_cv_detailed(cv_text)
+        if analysis:
+            results.append({
+                'cv_id': idx + 1,
+                'filename': file.filename,
+                'category': analysis['prediction']['predicted_category'],
+                'confidence': analysis['prediction']['top_predictions'][0]['probability'],
+                'quality_score': analysis['quality_score'],
+                'skills_count': analysis['skills_count'],
+                'experience_years': analysis['experience_years']
+            })
+
+    # Trier par score de qualité
+    results.sort(key=lambda x: x['quality_score'], reverse=True)
+
+    # Ajouter le rang
+    for idx, result in enumerate(results, 1):
+        result['rank'] = idx
+
+    return jsonify({
+        'total_cvs': len(results),
+        'results': results,
+        'errors': errors
     })
 
 
@@ -456,9 +619,9 @@ def get_categories():
     """Liste toutes les catégories disponibles"""
     if not label_encoder:
         return jsonify({'error': 'Modèle non chargé'}), 500
-    
+
     categories = label_encoder.classes_.tolist()
-    
+
     return jsonify({
         'total': len(categories),
         'categories': categories
@@ -470,25 +633,27 @@ def get_categories():
 # ========================================================================
 
 if __name__ == '__main__':
-    print("="*80)
+    print("=" * 80)
     print("DÉMARRAGE DU SERVEUR")
-    print("="*80)
-    
-    # Charger le dataset
+    print("=" * 80)
+
+    # Charger le dataset (et le modèle, s'il existe déjà, sinon l'entraîner)
     try:
         load_and_prepare_dataset()
         print("\n✅ Serveur prêt!")
-        print("="*80)
+        print("=" * 80)
         print("\nAccédez à l'application:")
-        print("  → http://localhost:5000")
+        print("  -> http://localhost:5000")
         print("\nAPI disponibles:")
-        print("  → GET  http://localhost:5000/api/stats")
-        print("  → POST http://localhost:5000/api/predict")
-        print("  → POST http://localhost:5000/api/analyze")
-        print("  → POST http://localhost:5000/api/compare")
-        print("="*80)
+        print("  -> GET  http://localhost:5000/api/stats")
+        print("  -> POST http://localhost:5000/api/predict")
+        print("  -> POST http://localhost:5000/api/analyze")
+        print("  -> POST http://localhost:5000/api/analyze-file")
+        print("  -> POST http://localhost:5000/api/compare")
+        print("  -> POST http://localhost:5000/api/compare-files")
+        print("=" * 80)
     except Exception as e:
         print(f"\n❌ Erreur lors du chargement: {e}")
-        print("Vérifiez le chemin du fichier CSV")
-    
+        print("Vérifiez le chemin du fichier CSV (variable CV_DATASET_PATH)")
+
     app.run(debug=True, host='0.0.0.0', port=5000)
